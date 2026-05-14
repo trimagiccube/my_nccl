@@ -6,9 +6,9 @@
 
 | 命令 | 文件 | 行数 | 大小 |
 |---|---|---|---|
-| `NCCL_DEBUG=INFO` | `logs/run_info.log` | 129 | 11 KB |
-| `NCCL_DEBUG=TRACE` | `logs/run_trace.log` | **129** | **11 KB**（和 INFO 一样！） |
-| `NCCL_DEBUG=TRACE NCCL_DEBUG_SUBSYS=ALL` | `logs/run_trace_all.log` | **2297** | **246 KB**（×18） |
+| `NCCL_DEBUG=INFO` | [`run_info.log`](../my_nccl_test/all_reduce_2proc/logs/run_info.log) | 129 | 11 KB |
+| `NCCL_DEBUG=TRACE` | [`run_trace.log`](../my_nccl_test/all_reduce_2proc/logs/run_trace.log) | **129** | **11 KB**（和 INFO 一样！） |
+| `NCCL_DEBUG=TRACE NCCL_DEBUG_SUBSYS=ALL` | [`run_trace_all.log`](../my_nccl_test/all_reduce_2proc/logs/run_trace_all.log) | **2297** | **246 KB**（×18） |
 
 `NCCL_DEBUG=TRACE` 单设——跟 INFO **没差别**。这是常见误区。
 
@@ -205,6 +205,9 @@ NCCL_DEBUG_FILE=/tmp/nccl-%h-%p.log \
 
 ## 引用
 
-- Log 三份：`my_nccl_test/all_reduce_2proc/logs/run_{info,trace,trace_all}.log`
+- Log 三份：
+  - [`run_info.log`](../my_nccl_test/all_reduce_2proc/logs/run_info.log) — `NCCL_DEBUG=INFO` 基线
+  - [`run_trace.log`](../my_nccl_test/all_reduce_2proc/logs/run_trace.log) — `NCCL_DEBUG=TRACE` 反例（跟 INFO 同输出）
+  - [`run_trace_all.log`](../my_nccl_test/all_reduce_2proc/logs/run_trace_all.log) — `TRACE + SUBSYS=ALL` 完整版
 - 源码：`nccl/src/debug.cc:22` 默认 mask，`debug.cc:53-105` SUBSYS 解析
 - 配套：[`nccl_debug_info_walkthrough.md`](nccl_debug_info_walkthrough.md)

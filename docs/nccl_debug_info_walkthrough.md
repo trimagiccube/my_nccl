@@ -358,6 +358,7 @@ line 100: nections 0.01, rest 0.01)
 
 ## 引用
 
-- Log: `my_nccl_test/all_reduce_2proc/logs/run_info.log`
-- 代码: `my_nccl_test/all_reduce_2proc/all_reduce_2proc.cu`
+- Log: [`run_info.log`](../my_nccl_test/all_reduce_2proc/logs/run_info.log)
+- 代码: [`all_reduce_2proc.cu`](../my_nccl_test/all_reduce_2proc/all_reduce_2proc.cu)
 - 配套概念: [concepts.md](concepts.md)
+- 想看更详细的输出: [nccl_debug_trace_walkthrough.md](nccl_debug_trace_walkthrough.md)（含 `TRACE + SUBSYS=ALL` 完整 246 KB log）
