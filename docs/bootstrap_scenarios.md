@@ -23,6 +23,43 @@
 
 ---
 
+## 题外话：rendezvous 是什么
+
+上面 step 4 写的是 "rendezvous（各 rank connect 到 rank 0）"，这个词在 NCCL 文档里反复出现，先把它澄清下。
+
+**字面**：法语 `rendez-vous`，由 `rendez`（去呈现自己 / 报到）+ `vous`（你/你们）构成 → "你来报到" → "约会、约定见面、集合点"。日常法语就是 "见面"、"预约"。18 世纪起被英语借走，泛指**"预先约定的会面地点 / 集结点"**。军事里很常见，"rendezvous point" 即"集合点"。
+
+**到分布式系统**：被技术圈征用来描述**"互不认识的进程在一个预先约定的位置找到彼此"**。本质就是"集合点"在网络里的对应物。
+
+```
+   现实世界                    分布式系统
+   ────────                    ──────────
+   "周六下午 3 点                "我们都去连 192.168.1.10:23456,
+    咖啡馆 A 见!"                 这个 socket 就是我们的集合点"
+        │                              │
+   你不需要知道每个朋友          每个 rank 不需要事先知道
+   长什么样、住哪里,             其他 rank 的 hostname/PID,
+   到了咖啡馆 A 自然碰上          连上那个 socket 自然碰上
+```
+
+**为什么需要 rendezvous**：N 个进程**互相不认识**（没有 hostname 列表、不知道 PID、不知道 GPU），但它们都拿到了**同一个"约定"**（128 字节的 `ncclUniqueId`，里头藏着 rank 0 的 IP:port）。所有 rank 拿着这个约定去同一个地方"报到"，在那里第一次彼此见面 —— 这就是 rendezvous。
+
+**rendezvous ≠ 自我介绍**：rendezvous 只负责"到了集合点"，不包含 step 5 的 `ncclPeerInfo` allgather（"互相通报身份"）。两者是相邻但独立的步骤。
+
+**其他系统也用这个词**：
+
+| 系统 | rendezvous 指什么 |
+|---|---|
+| **MPI** | `MPI_Init` 内部的进程发现阶段（PMI rendezvous） |
+| **PyTorch** | `torch.distributed.init_process_group` 底层就叫 `c10d::Store rendezvous`，机制类似 NCCL bootstrap |
+| **etcd / ZooKeeper** | 典型用法之一：所有节点去读同一个 key 当 rendezvous 点 |
+| **TCP 协议** | "TCP rendezvous" 指两端**同时** SYN，简单建连（罕见但术语存在） |
+| **NVLink Fabric Manager** | 跨节点 NVLink 也有 fabric rendezvous 这个内部术语 |
+
+**和 "discovery" 的细微区别**：`discovery` 强调"发现"（事先不知道谁会冒出来），`rendezvous` 强调"按约定碰头"（事先有共享的约定）。NCCL 用 rendezvous 而不用 discovery，恰恰是因为有 `ncclUniqueId` 这个预先共享的约定。
+
+---
+
 ## 场景 1：单进程多卡（`ncclCommInitAll`）
 
 例：`my_nccl_test/all_reduce_2gpu/` —— 1 个进程，绑 2 张同机 GPU。
