@@ -60,6 +60,356 @@
 
 ---
 
+## 题外话：Step 5 元数据交换详解
+
+上面 step 5 写的是"元数据 allgather"。其实**它不是一次 allgather，是一组多次的混合交换**。把它拆开看：
+
+```
+   ┌──────────────────────────────────────────────────────────────────────────┐
+   │  Phase A   AllGather1: ncclPeerInfo                  ←每 rank 80B 左右   │
+   │            "我是谁、我的 GPU/PID/host/能力"                              │
+   ├──────────────────────────────────────────────────────────────────────────┤
+   │  Phase B   本地拓扑探测 (不走 bootstrap, 各 rank 各自读 /sys)            │
+   │            生成本地 ncclTopoSystem (PCIe/NVLink/IB/NUMA 图)              │
+   ├──────────────────────────────────────────────────────────────────────────┤
+   │  Phase C   本地算法图搜索 (不走 bootstrap, 各 rank 跑相同算法)           │
+   │            得到 Ring/Tree/CollNet/NVLS 4 套 ncclTopoGraph                │
+   ├──────────────────────────────────────────────────────────────────────────┤
+   │  Phase D   AllGather3: graphInfo[4] + topoRanks      ←每 rank ~200B      │
+   │            "我算出来的环/树是这样的、我在每个 channel 上的邻居是谁"      │
+   ├──────────────────────────────────────────────────────────────────────────┤
+   │  Phase E   AllGather (CollNet only, 仅当 collnet 支持时)                 │
+   │            collnetShareInfo, dense rank 映射, 兼容性矩阵                 │
+   ├──────────────────────────────────────────────────────────────────────────┤
+   │  Phase F   逐 peer × 逐 channel 的点对点 handle 交换 (Send/Recv, 非 AG)  │
+   │            ncclConnect (256B/channel/peer)                               │
+   │            内容由 transport 决定: P2P 用 IPC handle, IB 用 QP/GID,       │
+   │            SHM 用 shm fd 等                                              │
+   └──────────────────────────────────────────────────────────────────────────┘
+```
+
+下面每个 phase 单独拆。
+
+### Phase A: AllGather1 — `ncclPeerInfo`
+
+源码 `nccl/src/include/transport.h:37`：
+
+```c
+struct ncclPeerInfo {
+    int       rank;            // 我的 rank
+    int       cudaDev;          // 我用哪张卡 (CUDA device index)
+    int       nvmlDev;          // 我用哪张卡 (NVML device index, 可能 ≠ cudaDev)
+    int       gdrSupport;       // 我的 GPU 支不支持 GPUDirect RDMA
+    uint64_t  hostHash;         // 我的 hostname 哈希 (同机 rank 此值相同)
+    uint64_t  pidHash;          // 我的 PID 哈希 (同进程 rank 此值相同)
+    dev_t     shmDev;           // 我的 /dev/shm 所在设备号 (判断 SHM 是否可用)
+    int64_t   busId;            // 我的 GPU PCIe bus ID
+    ncclComm *comm;             // 同进程 peer 才用得上 (跨进程是无效指针)
+    int       cudaCompCap;      // 我的 GPU 算力 (sm_80 → 80)
+    nvmlGpuFabricInfoV_t fabricInfo;  // ★ MNNVL: clusterUuid + cliqueId + state
+    int       cuMemSupport;     // 我支持 CUDA Virtual Memory Mgmt API 吗
+    int       version;          // 我的 NCCL 版本
+};
+```
+
+每条 80 字节左右。**这是后续所有选择的输入**：
+
+| 字段 | 拿来判断什么 |
+|---|---|
+| `hostHash` | 跟我同 host 的 rank → 走 P2P/SHM；不同 host → 走 NET |
+| `pidHash` | 同 host 同进程 → 不用 CUDA IPC（地址空间同）；同 host 不同进程 → 要 IPC |
+| `busId` + `cudaDev` | 算 NVLink 连接、PCIe 距离 |
+| `gdrSupport` | 跨机 NET transport 能不能上 GPUDirect RDMA |
+| `cudaCompCap` | 选 algo / kernel 变体 |
+| `fabricInfo.cliqueId` | 跨主机但同 NVLink fabric → 仍可走 P2P/NVLS（MNNVL） |
+| `cuMemSupport` | 选 CUMEM 后端 vs 老 cudaIpc |
+| `version` | mismatch 时 WARN |
+
+```
+   Phase A 在 bootstrap 上的流向:
+
+   rank 0           rank 1           rank 2           rank 3
+     │                │                │                │
+     │ fillInfo()     │ fillInfo()     │ fillInfo()     │ fillInfo()
+     │ → 本地 80B     │ → 本地 80B     │ → 本地 80B     │ → 本地 80B
+     ▼                ▼                ▼                ▼
+   ┌──────────────────────────────────────────────────────┐
+   │   bootstrapAllGather() over TCP ring                 │
+   │   每 rank 出 80B → 每 rank 收齐 N×80B = ncclPeerInfo[]│
+   └──────────────────────────────────────────────────────┘
+     │                │                │                │
+     ▼                ▼                ▼                ▼
+   完整 peer 表 (本地一份, 内容相同)
+```
+
+### Phase B & C: 拓扑探测 + 算法图搜索（不走 bootstrap）
+
+各 rank **本地**完成的两件事：
+
+```
+   ┌─ Phase B: 探测本地物理拓扑 ─────────────────────────┐
+   │   读 /sys/class/pci/, /sys/class/nvidia*/...        │
+   │   读 nvml: NVLink connectivity, fabric info         │
+   │   读 IB devices: ibv_get_device_list                │
+   │   ↓                                                  │
+   │   生成 struct ncclTopoSystem (PCIe + NVLink + NIC   │
+   │   + CPU NUMA 的图结构)                              │
+   └──────────────────────────────────────────────────────┘
+
+   ┌─ Phase C: 在拓扑上算 4 套算法图 ────────────────────┐
+   │   ncclTopoCompute(topo, ringGraph)    Pattern=RING  │
+   │   ncclTopoCompute(topo, treeGraph)    Pattern=TREE  │
+   │   ncclTopoCompute(topo, collNet...)   Pattern=...   │
+   │   ncclTopoCompute(topo, nvlsGraph)    Pattern=NVLS  │
+   │   ↓                                                  │
+   │   每个 ncclTopoGraph 包含: nChannels, bwIntra/Inter,│
+   │   typeIntra/Inter (NVL/PIX/PHB/SYS),  pattern...    │
+   └──────────────────────────────────────────────────────┘
+```
+
+这些步骤**完全本地**，不需要 bootstrap socket。但**因为每个 rank 都用同样的算法**，加上 Phase A 已经把 `ncclPeerInfo` 同步过，所以各 rank 算出来的图**理论上一致**——理论上。
+
+为了**实测确认一致并对齐元数据**，需要 Phase D。
+
+### Phase D: AllGather3 — 把每 rank 算的图汇总
+
+源码 `init.cc:749`：
+
+```c
+struct graphInfo {                   // 8 个 int, 32B
+    int pattern;                     // RING / TREE / NVLS ...
+    int nChannels;                   // 这个 algorithm 用几个 channel
+    int sameChannels;                // 各 channel 是否相同结构
+    float bwIntra, bwInter;          // 节点内 / 节点间带宽
+    int typeIntra, typeInter;        // NVL/PIX/PHB/SYS
+    int crossNic;                    // 是否跨网卡
+};
+
+struct ncclTopoRanks {               // 每 channel 一条
+    int ringRecv[MAXCHANNELS];       // 我在 channel c 的环里, 从谁收
+    int ringSend[MAXCHANNELS];       // 我在 channel c 的环里, 给谁发
+    int ringPrev[MAXCHANNELS];       // 环的上游邻居
+    int ringNext[MAXCHANNELS];       // 环的下游邻居
+    int treeToParent[MAXCHANNELS];   // 树的父节点 rank
+    int treeToChild0[MAXCHANNELS];   // 子节点 0
+    int treeToChild1[MAXCHANNELS];   // 子节点 1
+    int nvlsHeads[MAXCHANNELS];      // NVLS 多播头节点
+    int nvlsHeadNum;
+};
+
+struct allGatherInfo {
+    struct graphInfo  graphInfo[NCCL_NUM_ALGORITHMS];  // 4 套 algo × 32B = 128B
+    struct ncclTopoRanks topoRanks;                    // ~3.6 KB (MAXCHANNELS=32)
+    int cpuArch;                                       // x86 / arm / ppc
+    int cpuVendor;                                     // intel / amd / hygon
+};
+```
+
+每 rank ~3.8 KB。汇总后大家：
+- 知道全局 nNodes、rankToNode 映射（从 hostHash 算出来的）
+- 检查 CPU 异构（不同架构会 WARN）
+- 形成全局的 ring/tree 拓扑（每个 rank 的邻居都对齐）
+
+### Phase E: CollNet (可选，仅当支持 SHARP/NVLS Multicast)
+
+```
+collnet 路径下还有 3 次 bootstrap allgather (coll_net.cc:1242, 1306, 1386):
+  - userToDenseRank 映射 (int per rank, 4B)
+  - collnetShareInfo (跨 NCCL communicator 共享 collnet head 的信息)
+  - collnet 兼容性矩阵
+```
+
+普通用户场景一般跑不到。
+
+### Phase F: 逐 peer 点对点 handle 交换 (`ncclConnect`)
+
+**这是 step 5 里数据量最大、最讲究"按拓扑分情况"的一段**。源码在 `transport.cc:100` `ncclTransportP2pSetup`：
+
+```c
+#define CONNECT_SIZE 256
+struct ncclConnect {
+    char data[CONNECT_SIZE];   // 不透明 256B blob, 内容由具体 transport 填
+};
+```
+
+每对 (myRank, peerRank) × 每个 channel × 每个方向（send/recv），都要塞一个 256B 的 ncclConnect。**不再是 allgather**——是按"轮"做的 send/recv：
+
+```c
+for (int i=1; i<comm->nRanks; i++) {
+    recvPeer = (rank - i + nRanks) % nRanks;
+    sendPeer = (rank + i) % nRanks;
+    bootstrapSend(comm->bootstrap, recvPeer, tag, data, len);
+    bootstrapSend(comm->bootstrap, sendPeer, tag, data, len);
+    bootstrapRecv(comm->bootstrap, recvPeer, tag, data, len);
+    bootstrapRecv(comm->bootstrap, sendPeer, tag, data, len);
+}
+```
+
+每"轮"`i` 跟距离为 `i` 的两个邻居（左右环）交换；ring 越大，轮数越多。
+
+**256 字节里填什么 → 看选的是哪种 transport**：
+
+| transport | 填的内容 (`p2pConnectInfo` / `shmConnectInfo` / `ncclIbConnectionMetadata`) |
+|---|---|
+| **P2P (CUDA IPC / CUMEM)** | `rank, read, p2pBuff (ncclP2pBuff: handle + size + offset), desc` —— 对方拿这个 IPC handle 直接 mmap 自己的显存 |
+| **SHM** | `ncclShmIpcDesc_t (shm fd + size), shmBuffInfo` —— 通过 UDS 传 fd，建一段同机共享内存 |
+| **IB / RoCE** | `ncclIbQpInfo[N] (qpn, ece) + ncclIbDevInfo[N] (lid, gid, mtu, link_layer, fifoRkey, remoteGid) + fifoAddr + devName + ndevs` —— 完整的 IB QP 信息，对端拿来做 `ibv_modify_qp` 进 RTR/RTS state |
+| **NET sockets (fallback)** | 仅 IP+port，简单 |
+
+```
+   Phase F: 256B 包里填啥, 完全看 transport 选了谁
+
+   ┌─────────────── ncclConnect (256B) ───────────────┐
+   │                                                  │
+   │  case P2P (单机 NVLink/PCIe):                    │
+   │    ┌─ p2pConnectInfo ──────────────────────┐    │
+   │    │ rank, read                            │    │
+   │    │ p2pBuff { IPC handle, size, offset }  │    │
+   │    │ desc { extra IPC desc }               │    │
+   │    └───────────────────────────────────────┘    │
+   │                                                  │
+   │  case SHM (同机 fallback):                       │
+   │    ┌─ shmConnectInfo ──────────────────────┐    │
+   │    │ ncclShmIpcDesc { fd, size }           │    │
+   │    │ shmBuffInfo { offsets }               │    │
+   │    └───────────────────────────────────────┘    │
+   │                                                  │
+   │  case IB (跨机):                                  │
+   │    ┌─ ncclIbConnectionMetadata ────────────┐    │
+   │    │ qpInfo[N] { qpn, ece }                │    │
+   │    │ devs[N]   { lid, gid, mtu, rkey,...}  │    │
+   │    │ fifoAddr, devName, ndevs              │    │
+   │    └───────────────────────────────────────┘    │
+   │                                                  │
+   └──────────────────────────────────────────────────┘
+```
+
+### 一张表：Step 5 在 6 种场景下的具体差异
+
+| 维度 | 单进程多卡 | 单机 PCIe | 单机 NVLink | 跨机 IB | MNNVL | 多 comm split |
+|---|---|---|---|---|---|---|
+| **Phase A** (peerInfo) | 跑（同进程内）| 跑 | 跑 | 跑 | 跑 | 父 comm 已有, 仅子集 |
+| `hostHash` 关系 | 全 rank 相同 | 全 rank 相同 | 全 rank 相同 | 跨机 rank 不同 | 跨机 rank 不同 | 取决于子组 |
+| `pidHash` 关系 | 全 rank 相同 | 全 rank 不同 | 全 rank 不同 | 跨机/同机均不同 | 跨机/同机均不同 | 取决于子组 |
+| `fabricInfo.cliqueId` | 同 (但没用) | 同 (但没用) | 同 (但没用) | 不同 (但没 MNNVL) | **同 → 触发 MNNVL P2P** | 取决于父 comm |
+| **Phase B** (本地拓扑) | 跑 | 跑 | 跑 | 跑 | 跑 + fabric | 复用父 |
+| **Phase C** (算图) | Ring only | Ring | Ring + Tree | Ring + Tree + CollNet | + NVLS | 复用父 |
+| **Phase D** (graphInfo) | 跑（结果平凡）| 跑 | 跑 | 跑（节点感知）| 跑（clique 感知）| 仅子集 |
+| **Phase E** (CollNet) | 否 | 否 | 否 | 否 (一般) | 是 (NVLS) | 看父 |
+| **Phase F** ncclConnect 内容 | p2pBuff (进程内指针) | p2pConnectInfo (CUDA IPC handle) | p2pConnectInfo (CUMEM handle) | 大头：ncclIbConnectionMetadata | P2P/NVLS handle (跨主机！) | 复用父连接, 仅 reconfig |
+| 单次 Phase F 大小 | 256B (用一点点) | 256B (满载 IPC handle) | 256B (满载 CUMEM handle) | 256B (满载 IB QP+GID) | 256B (NVLS 多播 handle) | 256B (描述子集) |
+| Phase F 总轮数 | (N-1) | (N-1) | (N-1) | (N-1) | (N-1) | 复用 |
+
+### 一张图：4 种部署形态下 Phase F 真实交换路径
+
+```
+   场景 1: 单进程多卡 (N=2)
+   ───────────────────────
+   process
+   ┌────────────────────┐
+   │ rank 0 ─┐          │   ncclConnect 256B 在进程内
+   │         │  ←━━━━→  │   只复制结构体, 没真"传"
+   │ rank 1 ─┘          │
+   └────────────────────┘
+
+
+   场景 2/3: 单机多进程 (N=2, 同机不同进程)
+   ───────────────────────
+   process 0       process 1
+   ┌─────────┐    ┌─────────┐
+   │ rank 0  │    │ rank 1  │
+   │ GPU 0   │    │ GPU 1   │
+   └────┬────┘    └────┬────┘
+        │              │
+        └──TCP 同机────┘
+           bootstrap     ← Phase F 经 bootstrap socket
+           交换 IPC handle (256B)
+                          ↓
+   建好后 → GPU 直接通过 IPC mmap 对方显存
+            GPU 0 ═══ NVLink/PCIe ═══ GPU 1
+
+
+   场景 4: 跨机 IB (N=2, 两机各一卡)
+   ───────────────────────────
+   Node A                          Node B
+   ┌─────────┐                     ┌─────────┐
+   │ rank 0  │                     │ rank 1  │
+   │ GPU 0   │                     │ GPU 0   │
+   └────┬────┘                     └────┬────┘
+        │                               │
+        └─── TCP 跨机 (OOB) ────────────┘
+              bootstrap socket
+              交换 IB QP/GID/MR (256B)
+                                  ↓
+        建好后 → IB Verbs 建 RDMA 连接
+                GPU → IB HCA  ═══════ IB Switch ═══════ IB HCA → GPU
+                (GPUDirect RDMA, 如果支持)
+
+
+   场景 5: MNNVL (N=2, 跨 tray 但同 NVLink fabric)
+   ────────────────────────────────────────
+   Tray A                          Tray B
+   ┌─────────┐                     ┌─────────┐
+   │ rank 0  │                     │ rank 1  │
+   │ GPU 0   │                     │ GPU 0   │
+   │ clique=42                     │ clique=42 ← 同 cliqueId!
+   └────┬────┘                     └────┬────┘
+        │                               │
+        └─── TCP 跨机 (OOB) ────────────┘
+              bootstrap socket
+              交换 NVLS 多播 handle (256B)
+                                  ↓
+        建好后 → 通过跨节点 NVLink 直接 P2P / NVLS multicast
+                GPU 0 ═══ NVLink fabric (跨 tray!) ═══ GPU 0
+                (240 GB/s 级, 不走 IB)
+```
+
+### Step 5 一次 init 的总字节预算 (2 rank 估算)
+
+| Phase | 内容 | 数据量 |
+|---|---|---|
+| A (ncclPeerInfo allgather) | 2 × 80B = 160B | <1 KB |
+| D (allGatherInfo allgather) | 2 × ~3.8 KB ≈ 7.6 KB | ~8 KB |
+| F (per-peer ncclConnect) | 1 轮 × 2 方向 × 24 channel × 256B = 12 KB | ~12 KB |
+| **总计** | | **~20 KB** |
+
+跨机 IB 8 卡 × 2 机 (N=16) 的话：
+| Phase | 数据量 |
+|---|---|
+| A | 16 × 80B = 1.3 KB |
+| D | 16 × 3.8 KB ≈ 60 KB |
+| F | 15 轮 × 2 × 24 × 256B ≈ 180 KB（per rank，每个 rank 都做） |
+| **总计 per rank** | **~240 KB** |
+
+这就是 bootstrap socket 上跑的全部数据。**比起后续每秒几十 GB 的实际通信，是几乎可以忽略的开销**——但所有 fast path 都建立在这 240 KB 元数据正确传完的基础上。
+
+### 调 step 5 怎么 debug
+
+```bash
+# 只看元数据相关子系统:
+NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=INIT,GRAPH,NET,BOOTSTRAP ./run.sh
+
+# 看 GRAPH 子系统能确认 Phase B/C/D 的结果
+# 看 NET/IB 子系统能确认 Phase F 的 ncclIbConnectionMetadata 交换
+```
+
+源码定位表（想自己读源码）：
+
+| Phase | 文件 : 行 |
+|---|---|
+| A: ncclPeerInfo allgather | `nccl/src/init.cc:770` |
+| A: ncclPeerInfo struct | `nccl/src/include/transport.h:37` |
+| B: 拓扑探测入口 | `nccl/src/graph/topo.cc` `ncclTopoGetSystem` |
+| C: 算法图搜索 | `nccl/src/init.cc:891-944` |
+| D: allGatherInfo allgather | `nccl/src/init.cc:971` |
+| D: 结构体定义 | `nccl/src/init.cc:737-754` |
+| F: 逐 peer 交换主循环 | `nccl/src/transport.cc:100` `ncclTransportP2pSetup` |
+| F: 各 transport 填 256B | `nccl/src/transport/p2p.cc`, `shm.cc`, `net_ib.cc` |
+| F: P2P handle 结构 | `nccl/src/transport/p2p.cc:29` `p2pConnectInfo` |
+| F: IB handle 结构 | `nccl/src/transport/net_ib.cc:785-818` `ncclIbQpInfo` + `ncclIbConnectionMetadata` |
+
+---
+
 ## 场景 1：单进程多卡（`ncclCommInitAll`）
 
 例：`my_nccl_test/all_reduce_2gpu/` —— 1 个进程，绑 2 张同机 GPU。
