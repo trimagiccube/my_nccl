@@ -1,0 +1,129 @@
+=== Running: /home/xiaowen.yan/nccl-repo/my_nccl_test/all_reduce_2proc/all_reduce_2proc, NRANKS=2 ===
+    NCCL lib:      /home/xiaowen.yan/nccl-repo/nccl/build/lib
+    NCCL_DEBUG:    INFO
+    NCCL_UID_FILE: /tmp/nccl_uid_1278739.bin
+
+[rank 0] pid=1278747 bound to GPU 0
+aig-a100:1278747:1278747 [0] NCCL INFO Bootstrap : Using ens4f0np0:192.168.80.101<0>
+aig-a100:1278747:1278747 [0] NCCL INFO cudaDriverVersion 13000
+aig-a100:1278747:1278747 [0] NCCL INFO NCCL version 2.23.4+cuda12.9
+aig-a100:1278747:1278747 [0] NCCL INFO NET/Plugin: Could not find: libnccl-net.so. Using internal network plugin.
+aig-a100:1278747:1278747 [0] NCCL INFO NET/IB : Using [0]bnxt_re0:1/RoCE [RO]; OOB ens4f0np0:192.168.80.101<0>
+aig-a100:1278747:1278747 [0] NCCL INFO PROFILER/Plugin: Could not find: libnccl-profiler.so.
+aig-a100:1278747:1278747 [0] NCCL INFO Using network IB
+aig-a100:1278747:1278747 [0] NCCL INFO ncclCommInitRank comm 0x5ce61e459ee0 rank 0 nranks 2 cudaDev 0 nvmlDev 0 busId 8000 commId 0xf90ad11ce037dc5b - Init START
+aig-a100:1278747:1278747 [0] NCCL INFO Bootstrap timings total 0.001790 (create 0.000033, send 0.000168, recv 0.001293, ring 0.000026, delay 0.000000)
+aig-a100:1278747:1278747 [0] NCCL INFO Setting affinity for GPU 0 to ffffffff,00000000,ffffffff
+aig-a100:1278747:1278747 [0] NCCL INFO comm 0x5ce61e459ee0 rank 0 nRanks 2 nNodes 1 localRanks 2 localRank 0 MNNVL 0
+aig-a100:1278747:1278747 [0] NCCL INFO Channel 00/24 : 0 1
+aig-a100:1278747:1278747 [0] NCCL INFO Channel 01/24 : 0 1
+aig-a100:1278747:1278747 [0] NCCL INFO Channel 02/24 : 0 1
+aig-a100:1278747:1278747 [0] NCCL INFO Channel 03/24 : 0 1
+aig-a100:1278747:1278747 [0] NCCL INFO Channel 04/24 : 0 1
+aig-a100:1278747:1278747 [0] NCCL INFO Channel 05/24 : 0 1
+aig-a100:1278747:1278747 [0] NCCL INFO Channel 06/24 : 0 1
+aig-a100:1278747:1278747 [0] NCCL INFO Channel 07/24 : 0 1
+aig-a100:1278747:1278747 [0] NCCL INFO Channel 08/24 : 0 1
+aig-a100:1278747:1278747 [0] NCCL INFO Channel 09/24 : 0 1
+aig-a100:1278747:1278747 [0] NCCL INFO Channel 10/24 : 0 1
+aig-a100:1278747:1278747 [0] NCCL INFO Channel 11/24 : 0 1
+aig-a100:1278747:1278747 [0] NCCL INFO Channel 12/24 : 0 1
+aig-a100:1278747:1278747 [0] NCCL INFO Channel 13/24 : 0 1
+aig-a100:1278747:1278747 [0] NCCL INFO Channel 14/24 : 0 1
+aig-a100:1278747:1278747 [0] NCCL INFO Channel 15/24 : 0 1
+aig-a100:1278747:1278747 [0] NCCL INFO Channel 16/24 : 0 1
+aig-a100:1278747:1278747 [0] NCCL INFO Channel 17/24 : 0 1
+aig-a100:1278747:1278747 [0] NCCL INFO Channel 18/24 : 0 1
+aig-a100:1278747:1278747 [0] NCCL INFO Channel 19/24 : 0 1
+aig-a100:1278747:1278747 [0] NCCL INFO Channel 20/24 : 0 1
+aig-a100:1278747:1278747 [0] NCCL INFO Channel 21/24 : 0 1
+aig-a100:1278747:1278747 [0] NCCL INFO Channel 22/24 : 0 1
+aig-a100:1278747:1278747 [0] NCCL INFO Channel 23/24 : 0 1
+aig-a100:1278747:1278747 [0] NCCL INFO Trees [0] 1/-1/-1->0->-1 [1] 1/-1/-1->0->-1 [2] 1/-1/-1->0->-1 [3] 1/-1/-1->0->-1 [4] 1/-1/-1->0->-1 [5] 1/-1/-1->0->-1 [6] -1/-1/-1->0->1 [7] -1/-1/-1->0->1 [8] -1/-1/-1->0->1 [9] -1/-1/-1->0->1 [10] -1/-1/-1->0->1 [11] -1/-1/-1->0->1 [12] 1/-1/-1->0->-1 [13] 1/-1/-1->0->-1 [14] 1/-1/-1->0->-1 [15] 1/-1/-1->0->-1 [16] 1/-1/-1->0->-1 [17] 1/-1/-1->0->-1 [18] -1/-1/-1->0->1 [19] -1/-1/-1->0->1 [20] -1/-1/-1->0->1 [21] -1/-1/-1->0->1 [22] -1/-1/-1->0->1 [23] -1/-1/-1->0->1
+aig-a100:1278747:1278747 [0] NCCL INFO P2P Chunksize set to 524288
+aig-a100:1278747:1278767 [0] NCCL INFO [Proxy Service] Device 0 CPU core 66
+aig-a100:1278747:1278768 [0] NCCL INFO [Proxy Service UDS] Device 0 CPU core 3
+aig-a100:1278747:1278747 [0] NCCL INFO threadThresholds 8/8/64 | 16/8/64 | 512 | 512
+aig-a100:1278747:1278747 [0] NCCL INFO 24 coll channels, 24 collnet channels, 0 nvls channels, 32 p2p channels, 32 p2p channels per peer
+aig-a100:1278747:1278747 [0] NCCL INFO CC Off, Multi-GPU CC Off, workFifoBytes 1048576
+aig-a100:1278747:1278747 [0] NCCL INFO TUNER/Plugin: Could not find: libnccl-tuner.so libnccl-net.so. Using internal tuner plugin.
+aig-a100:1278747:1278747 [0] NCCL INFO ncclCommInitRank comm 0x5ce61e459ee0 rank 0 nranks 2 cudaDev 0 nvmlDev 0 busId 8000 commId 0xf90ad11ce037dc5b - Init COMPLETE
+aig-a100:1278747:1278747 [0] NCCL INFO Init timings - ncclCommInitRank: rank 0 nranks 2 total 0.20 (kernels 0.15, alloc 0.03, bootstrap 0.00, allgathers 0.00, topo 0.01, graphs 0.00, con[rank 1] pid=1278748 bound to GPU 1
+aig-a100:1278748:1278748 [1] NCCL INFO cudaDriverVersion 13000
+aig-a100:1278748:1278748 [1] NCCL INFO Bootstrap : Using ens4f0np0:192.168.80.101<0>
+aig-a100:1278748:1278748 [1] NCCL INFO NCCL version 2.23.4+cuda12.9
+aig-a100:1278748:1278748 [1] NCCL INFO NET/Plugin: Could not find: libnccl-net.so. Using internal network plugin.
+aig-a100:1278748:1278748 [1] NCCL INFO NET/IB : Using [0]bnxt_re0:1/RoCE [RO]; OOB ens4f0np0:192.168.80.101<0>
+aig-a100:1278748:1278748 [1] NCCL INFO PROFILER/Plugin: Could not find: libnccl-profiler.so.
+aig-a100:1278748:1278748 [1] NCCL INFO Using network IB
+aig-a100:1278748:1278748 [1] NCCL INFO ncclCommInitRank comm 0x61476c9e1c90 rank 1 nranks 2 cudaDev 1 nvmlDev 1 busId 9000 commId 0xf90ad11ce037dc5b - Init START
+aig-a100:1278748:1278748 [1] NCCL INFO Bootstrap timings total 0.000701 (create 0.000024, send 0.000125, recv 0.000418, ring 0.000022, delay 0.000000)
+aig-a100:1278748:1278748 [1] NCCL INFO Setting affinity for GPU 1 to ffffffff,00000000,ffffffff
+aig-a100:1278748:1278748 [1] NCCL INFO comm 0x61476c9e1c90 rank 1 nRanks 2 nNodes 1 localRanks 2 localRank 1 MNNVL 0
+aig-a100:1278748:1278748 [1] NCCL INFO Trees [0] -1/-1/-1->1->0 [1] -1/-1/-1->1->0 [2] -1/-1/-1->1->0 [3] -1/-1/-1->1->0 [4] -1/-1/-1->1->0 [5] -1/-1/-1->1->0 [6] 0/-1/-1->1->-1 [7] 0/-1/-1->1->-1 [8] 0/-1/-1->1->-1 [9] 0/-1/-1->1->-1 [10] 0/-1/-1->1->-1 [11] 0/-1/-1->1->-1 [12] -1/-1/-1->1->0 [13] -1/-1/-1->1->0 [14] -1/-1/-1->1->0 [15] -1/-1/-1->1->0 [16] -1/-1/-1->1->0 [17] -1/-1/-1->1->0 [18] 0/-1/-1->1->-1 [19] 0/-1/-1->1->-1 [20] 0/-1/-1->1->-1 [21] 0/-1/-1->1->-1 [22] 0/-1/-1->1->-1 [23] 0/-1/-1->1->-1
+aig-a100:1278748:1278748 [1] NCCL INFO P2P Chunksize set to 524288
+aig-a100:1278748:1278765 [1] NCCL INFO [Proxy Service] Device 1 CPU core 7
+aig-a100:1278748:1278766 [1] NCCL INFO [Proxy Service UDS] Device 1 CPU core 72
+aig-a100:1278748:1278748 [1] NCCL INFO threadThresholds 8/8/64 | 16/8/64 | 512 | 512
+aig-a100:1278748:1278748 [1] NCCL INFO 24 coll channels, 24 collnet channels, 0 nvls channels, 32 p2p channels, 32 p2p channels per peer
+aig-a100:1278748:1278748 [1] NCCL INFO TUNER/Plugin: Could not find: libnccl-tuner.so libnccl-net.so. Using internal tuner plugin.
+aig-a100:1278748:1278748 [1] NCCL INFO ncclCommInitRank comm 0x61476c9e1c90 rank 1 nranks 2 cudaDev 1 nvmlDev 1 busId 9000 commId 0xf90ad11ce037dc5b - Init COMPLETE
+aig-a100:1278748:1278748 [1] NCCL INFO Init timings - ncclCommInitRank: rank 1 nranks 2 total 0.20 (kernels 0.15, alloc 0.02, bootstrap 0.00, allgathers 0.00, topo 0.01, graphs 0.00, connections 0.01, rest 0.00)
+aig-a100:1278748:1278770 [1] NCCL INFO Channel 00/0 : 1[1] -> 0[0] via P2P/CUMEM/read
+aig-a100:1278748:1278770 [1] NCCL INFO Channel 01/0 : 1[1] -> 0[0] via P2P/CUMEM/read
+aig-a100:1278748:1278770 [1] NCCL INFO Channel 02/0 : 1[1] -> 0[0] via P2P/CUMEM/read
+aig-a100:1278748:1278770 [1] NCCL INFO Channel 03/0 : 1[1] -> 0[0] via P2P/CUMEM/read
+aig-a100:1278748:1278770 [1] NCCL INFO Channel 04/0 : 1[1] -> 0[0] via P2P/CUMEM/read
+aig-a100:1278748:1278770 [1] NCCL INFO Channel 05/0 : 1[1] -> 0[0] via P2P/CUMEM/read
+aig-a100:1278748:1278770 [1] NCCL INFO Channel 06/0 : 1[1] -> 0[0] via P2P/CUMEM/read
+aig-a100:1278748:1278770 [1] NCCL INFO Channel 07/0 : 1[1] -> 0[0] via P2P/CUMEM/read
+aig-a100:1278748:1278770 [1] NCCL INFO Channel 08/0 : 1[1] -> 0[0] via P2P/CUMEM/read
+aig-a100:1278748:1278770 [1] NCCL INFO Channel 09/0 : 1[1] -> 0[0] via P2P/CUMEM/read
+aig-a100:1278748:1278770 [1] NCCL INFO Channel 10/0 : 1[1] -> 0[0] via P2P/CUMEM/read
+aig-a100:1278748:1278770 [1] NCCL INFO Channel 11/0 : 1[1] -> 0[0] via P2P/CUMEM/read
+aig-a100:1278748:1278770 [1] NCCL INFO Channel 12/0 : 1[1] -> 0[0] via P2P/CUMEM/read
+aig-a100:1278748:1278770 [1] NCCL INFO Channel 13/0 : 1[1] -> 0[0] via P2P/CUMEM/read
+aig-a100:1278748:1278770 [1] NCCL INFO Channel 14/0 : 1[1] -> 0[0] via P2P/CUMEM/read
+aig-a100:1278748:1278770 [1] NCCL INFO Channel 15/0 : 1[1] -> 0[0] via P2P/CUMEM/read
+aig-a100:1278748:1278770 [1] NCCL INFO Channel 16/0 : 1[1] -> 0[0] via P2P/CUMEM/read
+aig-a100:1278748:1278770 [1] NCCL INFO Channel 17/0 : 1[1] -> 0[0] via P2P/CUMEM/read
+aig-a100:1278748:1278770 [1] NCCL INFO Channel 18/0 : 1[1] -> 0[0] via P2P/CUMEM/read
+aig-a100:1278748:1278770 [1] NCCL INFO Channel 19/0 : 1[1] -> 0[0] via P2P/CUMEM/read
+aig-a100:1278748:1278770 [1] NCCL INFO Channel 20/0 : 1[1] -> 0[0] via P2P/CUMEM/read
+aig-a100:1278748:1278770 [1] NCCL INFO Channel 21/0 : 1[1] -> 0[0] via P2P/CUMEM/read
+aig-a100:1278748:1278770 [1] NCCL INFO Channel 22/0 : 1[1] -> 0[0] via P2P/CUMEM/read
+aig-a100:1278748:1278770 [1] NCCL INFO Channel 23/0 : 1[1] -> 0[0] via P2P/CUMEM/read
+aig-a100:1278748:1278770 [1] NCCL INFO Connected all rings
+[rank 1] recvbuf[0] = 3.0  (expected 3.0)
+aig-a100:1278748:1278748 [1] NCCL INFO comm 0x61476c9e1c90 rank 1 nranks 2 cudaDev 1 busId 9000 - Destroy COMPLETE
+[rank 1] OK
+nections 0.01, rest 0.01)
+aig-a100:1278747:1278769 [0] NCCL INFO Channel 00/0 : 0[0] -> 1[1] via P2P/CUMEM/read
+aig-a100:1278747:1278769 [0] NCCL INFO Channel 01/0 : 0[0] -> 1[1] via P2P/CUMEM/read
+aig-a100:1278747:1278769 [0] NCCL INFO Channel 02/0 : 0[0] -> 1[1] via P2P/CUMEM/read
+aig-a100:1278747:1278769 [0] NCCL INFO Channel 03/0 : 0[0] -> 1[1] via P2P/CUMEM/read
+aig-a100:1278747:1278769 [0] NCCL INFO Channel 04/0 : 0[0] -> 1[1] via P2P/CUMEM/read
+aig-a100:1278747:1278769 [0] NCCL INFO Channel 05/0 : 0[0] -> 1[1] via P2P/CUMEM/read
+aig-a100:1278747:1278769 [0] NCCL INFO Channel 06/0 : 0[0] -> 1[1] via P2P/CUMEM/read
+aig-a100:1278747:1278769 [0] NCCL INFO Channel 07/0 : 0[0] -> 1[1] via P2P/CUMEM/read
+aig-a100:1278747:1278769 [0] NCCL INFO Channel 08/0 : 0[0] -> 1[1] via P2P/CUMEM/read
+aig-a100:1278747:1278769 [0] NCCL INFO Channel 09/0 : 0[0] -> 1[1] via P2P/CUMEM/read
+aig-a100:1278747:1278769 [0] NCCL INFO Channel 10/0 : 0[0] -> 1[1] via P2P/CUMEM/read
+aig-a100:1278747:1278769 [0] NCCL INFO Channel 11/0 : 0[0] -> 1[1] via P2P/CUMEM/read
+aig-a100:1278747:1278769 [0] NCCL INFO Channel 12/0 : 0[0] -> 1[1] via P2P/CUMEM/read
+aig-a100:1278747:1278769 [0] NCCL INFO Channel 13/0 : 0[0] -> 1[1] via P2P/CUMEM/read
+aig-a100:1278747:1278769 [0] NCCL INFO Channel 14/0 : 0[0] -> 1[1] via P2P/CUMEM/read
+aig-a100:1278747:1278769 [0] NCCL INFO Channel 15/0 : 0[0] -> 1[1] via P2P/CUMEM/read
+aig-a100:1278747:1278769 [0] NCCL INFO Channel 16/0 : 0[0] -> 1[1] via P2P/CUMEM/read
+aig-a100:1278747:1278769 [0] NCCL INFO Channel 17/0 : 0[0] -> 1[1] via P2P/CUMEM/read
+aig-a100:1278747:1278769 [0] NCCL INFO Channel 18/0 : 0[0] -> 1[1] via P2P/CUMEM/read
+aig-a100:1278747:1278769 [0] NCCL INFO Channel 19/0 : 0[0] -> 1[1] via P2P/CUMEM/read
+aig-a100:1278747:1278769 [0] NCCL INFO Channel 20/0 : 0[0] -> 1[1] via P2P/CUMEM/read
+aig-a100:1278747:1278769 [0] NCCL INFO Channel 21/0 : 0[0] -> 1[1] via P2P/CUMEM/read
+aig-a100:1278747:1278769 [0] NCCL INFO Channel 22/0 : 0[0] -> 1[1] via P2P/CUMEM/read
+aig-a100:1278747:1278769 [0] NCCL INFO Channel 23/0 : 0[0] -> 1[1] via P2P/CUMEM/read
+aig-a100:1278747:1278769 [0] NCCL INFO Connected all rings
+[rank 0] recvbuf[0] = 3.0  (expected 3.0)
+aig-a100:1278747:1278747 [0] NCCL INFO comm 0x5ce61e459ee0 rank 0 nranks 2 cudaDev 0 busId 8000 - Destroy COMPLETE
+[rank 0] OK
+ALL RANKS OK
