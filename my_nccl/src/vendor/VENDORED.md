@@ -3,26 +3,38 @@
 > 所有文件复制自 `../../nccl/` submodule, 基线 commit **8fb057cda230f6c8f6ed50dfcc92e40e1d88772c** (v2.23.4-1-5-g8fb057c).
 > 改动遵循 NCCL 的 BSD license (LICENSE.txt 在 ../../nccl/).
 
-## Phase 1 (本次)
+## 当前 vendor 状态
 
-| my_nccl 路径 | 来源 nccl 路径 | 是否已改 |
-|---|---|---|
-| `include/nccl.h` | `build/include/nccl.h` (构建产物, 已展开 .h.in 模板) | ☐ 未改 |
-| `include/socket.h` | `src/include/socket.h` | ☐ 未改 |
-| `include/bootstrap.h` | `src/include/bootstrap.h` | ☐ 未改 |
-| `include/utils.h` | `src/include/utils.h` | ☐ 未改 |
-| `include/debug.h` | `src/include/debug.h` | ☐ 未改 |
-| `include/transport.h` | `src/include/transport.h` | ☐ 未改 |
-| `include/comm.h` | `src/include/comm.h` | ☐ 未改 (Phase 2 会 stub 字段) |
-| `include/core.h` | `src/include/core.h` | ☐ 未改 |
-| `include/param.h` | `src/include/param.h` | ☐ 未改 |
-| `src/vendor/socket.cc` | `src/misc/socket.cc` | ☐ 未改 |
-| `src/vendor/bootstrap.cc` | `src/bootstrap.cc` | ☐ 未改 |
-| `src/vendor/utils.cc` | `src/misc/utils.cc` | ☐ 未改 |
-| `src/vendor/debug.cc` | `src/debug.cc` | ☐ 未改 |
-| `src/vendor/param.cc` | `src/misc/param.cc` | ☐ 未改 |
+`include/` 下保留 **31 个** header（Phase 1+2 实际需要的最小集；用 `g++ -M` 算出闭包后裁剪）。
+`src/vendor/` 下保留 **5 个** .cc。
 
-每次 `Phase X` 中有修改就在表里标记 ✓，并在下面单独列改动点。
+### include/ (31 个)
+
+```
+alloc.h       bitops.h         bootstrap.h    checks.h       collectives.h
+comm.h        core.h           cudawrap.h     debug.h        device.h
+graph.h       info.h           ipcsocket.h    nccl_common.h  nccl.h
+nccl_net.h    nccl_profiler.h  nccl_tuner.h   net_device.h   net.h
+nvmlwrap.h    nvtx.h           p2p.h          param.h        profiler.h
+proxy.h       register.h       shmutils.h     socket.h       strongstream.h
+utils.h
+```
+
+所有 header 来源 `nccl/src/include/<同名>.h`（基线 8fb057c），其中 **`nccl.h` 例外**——拷自 `nccl/build/include/nccl.h`（构建产物，已展开 .h.in 模板）。
+
+### src/vendor/ (5 个)
+
+| my_nccl 路径 | 来源 nccl 路径 |
+|---|---|
+| `src/vendor/socket.cc` | `src/misc/socket.cc` |
+| `src/vendor/bootstrap.cc` | `src/bootstrap.cc` |
+| `src/vendor/utils.cc` | `src/misc/utils.cc` |
+| `src/vendor/debug.cc` | `src/debug.cc` |
+| `src/vendor/param.cc` | `src/misc/param.cc` |
+
+### Phase 3+ 预计要补回来的 header
+
+由后续 vendor `graph/topo.cc` + `graph/xml.cc` 触发再拷回：可能涉及 `transport.h`、`coll_net.h`、`gdrwrap.h`、`ibv*.h`、`channel.h`、`cpuset.h` 等。**按需补**，不预先全拷。
 
 ## 改动清单
 
