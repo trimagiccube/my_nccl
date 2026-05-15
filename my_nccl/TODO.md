@@ -2,6 +2,7 @@
 
 > 每个 Phase 结束的标志是"能编译 / 能跑出预期"，然后 commit。
 > ✅ Phase 0 (骨架) ✅ Phase 1 (vendor 基础源) ✅ Phase 2 (链接通 + 单进程出 ncclUniqueId)
+> ✅ Phase 3a (2 进程 rendezvous + Phase A allgather)
 
 ---
 
@@ -39,18 +40,31 @@
 
 ---
 
-## Phase 3 — Vendor 拓扑层
+## Phase 3a — 2 进程 rendezvous + Phase A allgather ✅
 
-目标：把 Phase B 需要的 topo + xml 代码搬过来。
+- [x] 3a.1 把 `transport.h` vendor 回来 (Phase A 需要 ncclPeerInfo)
+- [x] 3a.2 重写 src/main.cc: 吃 `<rank> <nranks> <uid_file>`, 跑完整 rendezvous + bootstrapInit + bootstrapAllGather + 输出 peerInfo
+- [x] 3a.3 写 run.sh launcher (跟 my_nccl_test/all_reduce_2proc 的风格一致)
+- [x] 3a.4 修 ASan leak: proxy_stub 接管/释放 bootstrap.cc:697-701 那 3 个分配 (注释明确说 "proxy things are free'd elsewhere")
+- [x] 3a.5 跑 NRANKS=2 通过, 校验:
+    - 双方 magic 一致 → 进入同一通信组
+    - hostHash 一致 → 同机识别
+    - pidHash 不同 → 不同进程识别
+    - allgather 完整双向可见
 
-- [ ] 3.1 拷 `nccl/src/graph/topo.h`, `topo.cc`
-- [ ] 3.2 拷 `nccl/src/graph/xml.h`, `xml.cc`
-- [ ] 3.3 看 `topo.cc` 里有没有引用 `paths.cc` 的内容（如 `ncclTopoComputePaths`）。**Phase B 只到生成 ncclTopoSystem，不算路径**，所以 `paths.cc` 大概率不需要
-- [ ] 3.4 stub `collNetSupport()` / `collNetDevices()` / `ncclNvlsInit()` → 直接返回 0
-- [ ] 3.5 stub IB 部分（`ncclNet->devices()` 等）→ 返回 0 个设备；或者保留 net plugin 加载但跳过 IB
-- [ ] 3.6 跟前面 stub 一起编译，让 `ncclTopoGetSystem` 这个函数能被引用并链接成功
+---
 
-**完成条件**：链接通过，未跑。
+## Phase 3b — Vendor 拓扑层 (Phase B)
+
+目标：把 Phase B 需要的 topo + xml 代码搬过来, 真探测出 ncclTopoSystem。
+
+- [ ] 3b.1 拷 `nccl/src/graph/topo.h`, `topo.cc`, `xml.h`, `xml.cc`
+- [ ] 3b.2 看 `topo.cc` 里有没有引用 `paths.cc` 的内容（如 `ncclTopoComputePaths`）。**Phase B 只到生成 ncclTopoSystem，不算路径**，所以 `paths.cc` 大概率不需要
+- [ ] 3b.3 stub `collNetSupport()` / `collNetDevices()` / `ncclNvlsInit()` → 直接返回 0
+- [ ] 3b.4 stub IB 部分（`ncclNet->devices()` 等）→ 返回 0 个设备
+- [ ] 3b.5 把 main.cc 接上 `ncclTopoGetSystem`, dump XML
+
+**完成条件**：链接通过 + 跑出来一份 XML。
 
 ---
 
