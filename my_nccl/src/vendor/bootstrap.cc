@@ -726,6 +726,9 @@ ncclResult_t bootstrapInit(int nHandles, void* handles, struct ncclComm* comm) {
   return ncclSuccess;
 }
 
+// my_nccl: 不调 bootstrapSplit (subgroup 派生), 它访问 comm->config.splitShare
+// 等被裁掉的字段, 直接 #if 0 整个函数避免污染 ncclComm.
+#if 0
 ncclResult_t bootstrapSplit(uint64_t magic, struct ncclComm* comm, struct ncclComm* parent, int color, int key, int* parentRanks) {
   ncclResult_t ret = ncclSuccess;
   int rank = comm->rank;
@@ -801,6 +804,7 @@ fail:
   free(proxySocket);
   goto exit;
 }
+#endif  // my_nccl: end of #if 0 bootstrapSplit
 
 struct socketAckInfo {
   int rank;
@@ -819,6 +823,7 @@ fail:
   (void)ncclSocketClose(sock);
   return ret;
 }
+
 ncclResult_t bootstrapSend(void* commState, int peer, int tag, void* data, int size) {
   ncclResult_t ret = ncclSuccess;
   struct ncclSocket sock;
