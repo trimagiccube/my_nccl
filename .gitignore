@@ -9,6 +9,12 @@ my_nccl_test/*/all_reduce_2proc
 my_nccl/my_nccl_bootstrap
 my_nccl/**/*.o
 
+# cscope index (anywhere)
+cscope.out
+cscope.in.out
+cscope.po.out
+cscope.files
+
 # Editor swap / temp
 *.swp
 *.swo
