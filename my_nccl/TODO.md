@@ -1,37 +1,41 @@
 # TODO
 
-> 每个 Phase 结束的标志是"能编译 / 能跑出预期"，然后 commit。Phase 0 完成（骨架就位）。
+> 每个 Phase 结束的标志是"能编译 / 能跑出预期"，然后 commit。
+> ✅ Phase 0 (骨架) ✅ Phase 1 (vendor 基础源) ✅ Phase 2 (链接通 + 单进程出 ncclUniqueId)
 
 ---
 
-## Phase 1 — Vendor 基础源文件
+## Phase 1 — Vendor 基础源文件 ✅
 
-目标：把 bootstrap 协议层需要的最少 NCCL 源文件搬过来，stub 掉无关字段，**先不动 topo**。
+目标：把 bootstrap 协议层需要的最少 NCCL 源文件搬过来。
 
-- [ ] 1.1 拷 `nccl/build/include/nccl.h`（构建产物, 已展开模板）→ `include/nccl.h`
-- [ ] 1.2 拷 `nccl/src/include/socket.h`, `nccl/src/misc/socket.cc` → `include/`, `src/vendor/`
-- [ ] 1.3 拷 `nccl/src/include/bootstrap.h`, `nccl/src/bootstrap.cc`
-- [ ] 1.4 拷 `nccl/src/include/utils.h`, `nccl/src/utils.cc`
-- [ ] 1.5 拷 `nccl/src/include/debug.h`, `nccl/src/debug.cc`
-- [ ] 1.6 拷 `nccl/src/include/transport.h`（只为 `ncclPeerInfo` 结构）
-- [ ] 1.7 拷 `nccl/src/include/comm.h`，**stub** 掉所有 channel/proxy/kernel/CUDA stream 相关字段
-- [ ] 1.8 整理 `#include` 链，把所有未满足依赖列成表（决定下一步是 stub 还是再 vendor）
+- [x] 1.1 拷 `nccl/build/include/nccl.h`（构建产物, 已展开模板）→ `include/nccl.h`
+- [x] 1.2 拷 `socket.{h,cc}`, `bootstrap.{h,cc}`, `utils.{h,cc}`, `debug.{h,cc}`, `param.{h,cc}`
+- [x] 1.3 拷 `transport.h`, `comm.h`, `core.h`
+- [x] 1.4 整个 `nccl/src/include/*.h` 都拷了（46 个 header）省得边编边补
+- [x] 1.5 学到一个事实：`nvtx.h` 在 CUDA 12.9 上编不过（nvtx3 版本不对应）→ **替换成 stub**（详见 VENDORED.md）
 
-**完成条件**：上面 7 个文件能单独 `g++ -c` 编过（可能允许 main 链接错误，但 .o 都出来）。
+**实际结果**：5 个 vendor .cc 全部单独 `g++ -c` 通过，零警告。
 
 ---
 
-## Phase 2 — Stub transport/proxy/kernel
+## Phase 2 — Stub + 最小 main ✅
 
-目标：让 vendored 代码能链接成功，**不要求功能正确**，只要符号都解析得了。
+目标：让 vendored 代码能链接成功 + 跑出 ncclUniqueId。
 
-- [ ] 2.1 列出 `bootstrap.cc` 里所有访问 `comm->xxx` 的字段，确认哪些 stub 字段被读、需要"看起来合理"的默认值
-- [ ] 2.2 写 `src/stubs/transport_stub.cc`，桩掉 `ncclTransportP2pSetup`, `selectTransport<>`, proxy 启动等 `ncclTopoGetSystem` 调用链里碰到的符号
-- [ ] 2.3 写 `src/stubs/proxy_stub.cc`，桩掉 `ncclProxyConnect` 等
-- [ ] 2.4 写 `src/stubs/kernel_stub.cc`，桩掉 CUDA kernel 加载相关（如果链接路径上有的话）
-- [ ] 2.5 写最小 `main.cc`：只调 `ncclGetUniqueId` 并打印；目标是验证链接通过
+- [x] 2.1 写最小 `src/main.cc`：调 `bootstrapNetInit` + `bootstrapGetUniqueId`，打印 128B id 的 hex
+- [x] 2.2 写 `Makefile`：vendor + stubs + main，含 ASan/UBSan，`make help` 支持
+- [x] 2.3 首次链接失败：仅缺 1 个 `ncclProxyInit`（bootstrap 末尾起 proxy 线程时调）→ 写 `src/stubs/proxy_stub.cc` no-op
+- [x] 2.4 链接通过 → `./my_nccl_bootstrap` 跑出真 ncclUniqueId
 
-**完成条件**：`./my_nccl_minimal` 单进程能跑起来，调出 ncclUniqueId 并打印。
+**实际产物**：
+- `magic=0xc02b5815d3aedd4f`（真随机）
+- 字节解码：IPv4 = 192.168.80.101 port 24542（socket addr）
+- 跟之前 `aig-a100` 实测 NCCL 的 OOB iface 完全对得上
+
+**没用到的 stub（推迟）**：
+- transport_stub.cc / kernel_stub.cc：当前链接路径上没碰到
+- 只 stub 了 `ncclProxyInit`，已足够单进程跑 bootstrap rendezvous
 
 ---
 

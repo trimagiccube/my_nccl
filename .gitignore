@@ -5,6 +5,10 @@ build/
 my_nccl_test/*/all_reduce_2gpu
 my_nccl_test/*/all_reduce_2proc
 
+# my_nccl build artifacts
+my_nccl/my_nccl_bootstrap
+my_nccl/**/*.o
+
 # Editor swap / temp
 *.swp
 *.swo
