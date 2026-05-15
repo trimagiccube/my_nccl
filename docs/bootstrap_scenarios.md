@@ -69,8 +69,9 @@
    │  Phase A   AllGather1: ncclPeerInfo                  ←每 rank 80B 左右   │
    │            "我是谁、我的 GPU/PID/host/能力"                              │
    ├──────────────────────────────────────────────────────────────────────────┤
-   │  Phase B   本地拓扑探测 (不走 bootstrap, 各 rank 各自读 /sys)            │
-   │            生成本地 ncclTopoSystem (PCIe/NVLink/IB/NUMA 图)              │
+   │  Phase B   拓扑探测: 各 rank 只探"自己那部分" (自己的 GPU + 自己看到的   │
+   │            NIC), 同 node ranks 通过 bootstrapIntraNodeAllGather 融合,    │
+   │            合成完整 ncclTopoSystem (6 类节点的图)                        │
    ├──────────────────────────────────────────────────────────────────────────┤
    │  Phase C   本地算法图搜索 (不走 bootstrap, 各 rank 跑相同算法)           │
    │            得到 Ring/Tree/CollNet/NVLS 4 套 ncclTopoGraph                │
@@ -142,34 +143,292 @@ struct ncclPeerInfo {
    完整 peer 表 (本地一份, 内容相同)
 ```
 
-### Phase B & C: 拓扑探测 + 算法图搜索（不走 bootstrap）
+### Phase B: 拓扑探测（有去重机制，不是各 rank 全干一遍！）
 
-各 rank **本地**完成的两件事：
+> **⚠ 直觉陷阱**：如果说"每个 rank 都本地读 /sys 探拓扑"，那同 node 8 个 rank 不就把同样的 /sys 树读 8 遍？是不是浪费？
+>
+> 答：**NCCL 不是这么做的**。它有一套"各 rank 只探自己那部分 + intra-node 合并"的去重设计。
+
+#### 真实流程（源码 `nccl/src/graph/topo.cc:728` `ncclTopoGetSystem`）
 
 ```
-   ┌─ Phase B: 探测本地物理拓扑 ─────────────────────────┐
-   │   读 /sys/class/pci/, /sys/class/nvidia*/...        │
-   │   读 nvml: NVLink connectivity, fabric info         │
-   │   读 IB devices: ibv_get_device_list                │
-   │   ↓                                                  │
-   │   生成 struct ncclTopoSystem (PCIe + NVLink + NIC   │
-   │   + CPU NUMA 的图结构)                              │
-   └──────────────────────────────────────────────────────┘
-
-   ┌─ Phase C: 在拓扑上算 4 套算法图 ────────────────────┐
-   │   ncclTopoCompute(topo, ringGraph)    Pattern=RING  │
-   │   ncclTopoCompute(topo, treeGraph)    Pattern=TREE  │
-   │   ncclTopoCompute(topo, collNet...)   Pattern=...   │
-   │   ncclTopoCompute(topo, nvlsGraph)    Pattern=NVLS  │
-   │   ↓                                                  │
-   │   每个 ncclTopoGraph 包含: nChannels, bwIntra/Inter,│
-   │   typeIntra/Inter (NVL/PIX/PHB/SYS),  pattern...    │
-   └──────────────────────────────────────────────────────┘
+   ┌─ Step 1: 看有没有 NCCL_TOPO_FILE / 默认 XML 缓存 ─────────────────┐
+   │   if (NCCL_TOPO_FILE) → 直接读 → 跳过下面所有探测              │
+   │   else 尝试 /var/run/nvidia-topologyd/virtualTopology.xml        │
+   │   都没有 → 各 rank 自己探                                        │
+   └────────────────────────────────────────────────────────────────┘
+                              ↓ (没缓存时)
+   ┌─ Step 2: 本地探, 但只探"自己那一份" ───────────────────────────┐
+   │   ncclTopoFillGpu(busId_of_my_rank)                            │
+   │     ↳ 只 fill 当前 rank 管的那张 GPU 进 XML                    │
+   │   ncclNet->devices(...) + getProperties() for each NIC         │
+   │     ↳ 自己 process 看到的 NIC                                  │
+   │                                                                 │
+   │   注释原文 (topo.cc:755):                                       │
+   │     "Detect only the GPU managed by this process.               │
+   │      We'll get any others through XML fusion."                  │
+   └────────────────────────────────────────────────────────────────┘
+                              ↓
+   ┌─ Step 3: 同 node ranks 互换自己的 XML ────────────────────────┐
+   │   bootstrapIntraNodeAllGather(local rank, local XML, ...)     │
+   │                                                                │
+   │   ★ 用的是 IntraNode 版本! 不是普通 bootstrapAllGather:       │
+   │     - 只在 hostHash 相同的 rank 之间交换                       │
+   │     - 走 UDS (Unix Domain Socket) 不走 TCP, 更快               │
+   │     - 跨 node 不交换 (跨 node 的部分留给 IB/NET 后面去发现)    │
+   └────────────────────────────────────────────────────────────────┘
+                              ↓
+   ┌─ Step 4: 融合所有本地 rank 的 XML ─────────────────────────────┐
+   │   for each peer_xml in local_ranks:                            │
+   │     ncclTopoFuseXml(my_xml, peer_xml)                          │
+   │                                                                 │
+   │   融合后, 每个本地 rank 都拿到包含本 node 所有 GPU+NIC 的       │
+   │   完整 XML (内容相同)                                          │
+   └────────────────────────────────────────────────────────────────┘
+                              ↓
+   ┌─ Step 5: (可选) 转 XML 落盘 ──────────────────────────────────┐
+   │   if (NCCL_TOPO_DUMP_FILE)                                     │
+   │     ncclTopoDumpXmlToFile(...)  ←下次跑直接读                  │
+   └────────────────────────────────────────────────────────────────┘
+                              ↓
+   ┌─ Step 6: XML → 内存图结构 ────────────────────────────────────┐
+   │   ncclTopoGetSystemFromXml(xml, &ncclTopoSystem, hostHash)     │
+   │   → 得到内存里的 ncclTopoSystem 图                             │
+   └────────────────────────────────────────────────────────────────┘
 ```
 
-这些步骤**完全本地**，不需要 bootstrap socket。但**因为每个 rank 都用同样的算法**，加上 Phase A 已经把 `ncclPeerInfo` 同步过，所以各 rank 算出来的图**理论上一致**——理论上。
+**所以同 node 两个 rank 会不会重复**：
+- ❌ 不会重复全部 /sys 扫描——每个 rank 只 fill 自己管的 GPU + 自己看到的 NIC
+- ✅ 但 NCCL **乐于让 PCIe 父节点树等公共部分被各 rank 各自走一遍**——XML fusion 会去重，多探一遍开销也只 ms 级。读 nvml 也是各 rank 自己读（每张 GPU 一个 handle）
+- ✅ 真正去重的关键是：**每个 rank 出的 XML 只包含自己 GPU + 自己 NIC 的子图**，靠 bootstrapIntraNodeAllGather 拼起来
 
-为了**实测确认一致并对齐元数据**，需要 Phase D。
+#### 一张图：8 卡同 node 的拓扑发现
+
+```
+      Node aig-a100 (hostHash=0xabcd, 8 ranks)
+   ┌─────────────────────────────────────────────────────────────────────┐
+   │                                                                     │
+   │  rank 0   rank 1   rank 2   rank 3  ...  rank 7                     │
+   │  ┌────┐  ┌────┐  ┌────┐  ┌────┐       ┌────┐                       │
+   │  │探  │  │探  │  │探  │  │探  │       │探  │                       │
+   │  │GPU0│  │GPU1│  │GPU2│  │GPU3│       │GPU7│  ←本地探, 各探一张    │
+   │  │+NIC│  │+NIC│  │+NIC│  │+NIC│       │+NIC│   (PCIe 父链可能重复) │
+   │  └─┬──┘  └─┬──┘  └─┬──┘  └─┬──┘       └─┬──┘                       │
+   │    │       │       │       │             │                          │
+   │    └───────┴───────┴─bootstrapIntraNodeAllGather────────────────┐   │
+   │             (UDS, 不走 TCP)                                     │   │
+   │                                                                  │   │
+   │    rank 0 收到 [GPU0,GPU1,GPU2,GPU3,...,GPU7] 8 份 XML 子图     │   │
+   │    rank 1 收到 [GPU0,GPU1,GPU2,GPU3,...,GPU7] 8 份 XML 子图     │   │
+   │    ...    (各 rank 都收同样的 8 份)                              │   │
+   │                                                                  │   │
+   │    本地 ncclTopoFuseXml() 合并 → 完整 ncclTopoSystem (各 rank   │   │
+   │    内存里都是一份相同的图)                                       │   │
+   │                                                                  │   │
+   └─────────────────────────────────────────────────────────────────────┘
+
+   跨 node 怎么办?
+   ─────────────
+   bootstrapIntraNodeAllGather 只在同 hostHash 的 rank 间做.
+   跨 node 的拓扑不在 Phase B 处理 — 各 node 的 NCCL 后面用网络
+   transport (IB) 实际连通时再"发现"对端.
+   每个 node 自己保存自己的拓扑视图, NCCL 用 hostHash 字段在
+   ncclTopoSystem 里区分跨 node 的"节点".
+```
+
+#### `ncclTopoSystem` 的样子（最终的拓扑表示）
+
+源码 `nccl/src/graph/topo.h:155`：
+
+```c
+struct ncclTopoSystem {
+    int systemId;
+    uint64_t hostHashes[NCCL_TOPO_MAX_NODES];   // 每个 node 的 hostHash
+    int nHosts;
+    struct ncclTopoNodeSet nodes[NCCL_TOPO_NODE_TYPES];  // 6 大类节点
+    float maxBw, totalBw;
+};
+```
+
+6 类节点：
+
+| Type | 含义 | 例子 |
+|---|---|---|
+| `GPU = 0` | NVIDIA GPU | A100 / H100 |
+| `PCI = 1` | PCIe 桥 / switch | PLX / PCIe root complex |
+| `NVS = 2` | NVSwitch | DGX A100 上的 6 个 NVSwitch |
+| `CPU = 3` | NUMA 域（不是物理 CPU socket）| socket 0 / socket 1 |
+| `NIC = 4` | 网卡硬件 | bnxt_re0, mlx5_0 |
+| `NET = 5` | NCCL 看到的网络端点 | port 0, port 1 |
+
+节点之间用 `ncclTopoLink` 连边，link 类型：
+
+| Link type | 数值 | 含义 |
+|---|---|---|
+| `LINK_LOC` | 0 | 自己到自己 |
+| `LINK_NVL` | 1 | NVLink |
+| `LINK_PCI` | 3 | PCIe |
+| `LINK_SYS` | 7 | 跨 NUMA / QPI / UPI |
+| `LINK_NET` | 8 | 网络 |
+
+**算路径时**还多出一组 "PATH 类型"（多跳的）：
+
+| Path | 含义 |
+|---|---|
+| `PATH_LOC = 0` | 本地 |
+| `PATH_NVL = 1` | 一跳 NVLink |
+| `PATH_NVB = 2` | NVLink 经一个中间 GPU 中转 |
+| `PATH_PIX = 3` | 一个 PCIe 桥 |
+| `PATH_PXB = 4` | 多个 PCIe 桥（不过 host bridge）|
+| `PATH_PXN = 5` | GPU 经过另一个本地 GPU 转发到 NIC（rail-local）|
+| `PATH_PHB = 6` | 经过 PCIe host bridge（即过 CPU 根桥）|
+| `PATH_SYS = 7` | 跨 NUMA 域 |
+| `PATH_NET = 8` | 走网络 |
+| `PATH_DIS = 9` | 不通 |
+
+`NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=GRAPH` 看到的 `(1/240.0/NVL)`、`(2/24.0/PHB)` 等就是 (跳数 / 带宽 / 路径类型) 的缩写。
+
+#### 本机实测的拓扑 XML (NCCL_TOPO_DUMP_FILE 真实产物)
+
+> 真实文件在 [`logs/aig-a100-topo.xml`](../my_nccl_test/all_reduce_2proc/logs/aig-a100-topo.xml)
+> （25 行，1.7 KB，rank 0 在 init 时 dump 出来的最终融合 XML）
+
+简化后结构：
+
+```xml
+<system version="1">
+  <cpu numaid="0" host_hash="0x40c83cfe216cc077" affinity=... arch="x86_64" vendor="GenuineIntel">
+    <pci busid="0000:04:00.0" link_speed="32.0 GT/s PCIe" link_width="16">   <!-- PCIe root -->
+      <pci busid="0000:06:00.0" link_speed="5.0 GT/s" link_width="16">       <!-- PLX switch -->
+        <pci busid="0000:08:00.0" link_speed="16.0 GT/s PCIe">               <!-- GPU 0 endpoint -->
+          <gpu dev="0" sm="80" rank="0" gdr="1">
+            <nvlink target="0000:09:00.0" count="12" tclass="0x030200"/>     <!-- 12 条 NVLink to GPU 1 -->
+          </gpu>
+        </pci>
+        <pci busid="0000:09:00.0" link_speed="16.0 GT/s PCIe">               <!-- GPU 1 endpoint -->
+          <gpu dev="1" sm="80" rank="1" gdr="1">
+            <nvlink target="0000:08:00.0" count="12"/>                        <!-- 反向 12 条 NVLink -->
+          </gpu>
+        </pci>
+      </pci>
+    </pci>
+  </cpu>
+  <cpu numaid="1" host_hash="0x40c83cfe216cc077">
+    <pci busid="0000:d4:00.0" link_speed="8.0 GT/s PCIe" link_width="8">
+      <nic>
+        <net name="bnxt_re0" dev="0" speed="2500" gdr="0"/>                  <!-- RoCE 网卡, gdr=0 -->
+      </nic>
+    </pci>
+  </cpu>
+</system>
+```
+
+可以注意几件事：
+- **两个 `<cpu>` 节点** = 两个 NUMA 域（看 `affinity` 位图能反推 socket 拓扑）
+- **GPU 0/1 挂在 NUMA 0 下**，通过两层 PCIe switch (`0x1000:c030` = LSI/PLX 桥) 连到 root
+- **`<nvlink target=... count="12">`** —— A100 SXM4 之间 12 条 NVLink link，每条 25 GB/s ≈ 总 300 GB/s（理论），NCCL 算的 maxBw 240 GB/s 是实测有效值
+- **NIC 在 NUMA 1**，跟 GPU 不同 socket —— 如果走 IB 跨机数据通路，需要跨 SYS link（QPI/UPI），所以 GDR 默认 disable
+- **`host_hash="0x40c83cfe216cc077"`** —— 这就是 `ncclPeerInfo.hostHash` 那个值，整 system 范围内唯一
+
+用 xq 玩一玩：
+
+```bash
+xq '.' aig-a100-topo.xml              # JSON 化后看树
+xq '..|.gpu?|select(.!=null)' aig-a100-topo.xml   # 列所有 GPU 节点
+xq '..|.["@busid"]?|select(.!=null)' aig-a100-topo.xml   # 列所有 PCIe busid
+xq '.system.cpu | length' aig-a100-topo.xml            # 几个 NUMA 域
+```
+
+下次再起 NCCL 直接：
+
+```bash
+NCCL_TOPO_FILE=aig-a100-topo.xml ./run.sh    # 跳过 Phase B 探测
+```
+
+#### 本机的内存表示 ncclTopoSystem (从 trace_all.log 反推, 跟 XML 一一对应)
+
+```
+   ncclTopoSystem (aig-a100, 2 卡 A100 + 1 IB)
+   ════════════════════════════════════════════════
+
+   hostHashes = [0xabcd...]   (本 host 一个)
+   nHosts     = 1
+
+   nodes[CPU]  count=2:
+                ├─ CPU/0-0  (NUMA 0)  ←─┐
+                └─ CPU/0-1  (NUMA 1) ←─┐│
+                          │            │└──SYS 10 GB/s
+                          └────────────┘  (跨 socket QPI)
+
+   nodes[PCI]  count=1:
+                └─ PCI/0-4000  (PCIe root, NUMA 0 下)
+                          │
+                       ┌──┴──┐
+                  PCI[24]  PCI[24]     ← PCIe Gen4 x16, 24 GB/s
+                       │     │
+   nodes[GPU]  count=2:│     │
+                ├─ GPU/0-8000 (A100, GPU 0)
+                │             │
+                │             └─NVL[240]─┐
+                │                        │  ← NVLink, 240 GB/s
+                └─ GPU/0-9000 (A100, GPU 1)
+                              │
+                              └─NVL[240]─┘
+
+   nodes[NIC]  count=1:
+                └─ NIC/0-d4000 (Broadcom RoCE, NUMA 1 下)
+
+   nodes[NET]  count=1:
+                └─ NET (port 0 on bnxt_re0)
+
+   nodes[NVS]  count=0   (A100 SXM4 板没装 NVSwitch, 直连)
+
+   maxBw   = 240.0     (NVLink)
+   totalBw = 240.0
+```
+
+把 trace_all.log 第 20-32 行那段树状打印对回去，每一行都能在上面这张图里定位到。
+
+#### 缓存机制：复用拓扑的几种方式
+
+| 方法 | 用法 | 适用场景 |
+|---|---|---|
+| `NCCL_TOPO_FILE=path/to/topo.xml` | 启动前指向预先 dump 好的 XML | CI/生产固定机型，加速 init |
+| `/var/run/nvidia-topologyd/virtualTopology.xml` | 默认查询路径（无需任何 env）| 有 `nvidia-topologyd` 守护进程的机器 |
+| `NCCL_TOPO_DUMP_FILE=path` | 当前 run **导出**所有 rank 融合后的 XML | 第一次跑后给后续用 |
+| `NCCL_TOPO_DUMP_FILE_RANK=N` | 指定哪个 rank 来 dump（默认 0） | 多 rank 时避免大家都写 |
+
+工作流：
+
+```bash
+# 第一次跑, 让 rank 0 把拓扑导出
+NCCL_TOPO_DUMP_FILE=/tmp/nccl_topo.xml ./run.sh
+
+# 之后所有跑用这份缓存
+NCCL_TOPO_FILE=/tmp/nccl_topo.xml ./run.sh
+```
+
+缓存后 Phase B **整段跳过**——直接读 XML、不动 /sys、不发 bootstrap intra-node allgather。生产里频繁起 NCCL（PyTorch DDP 重启）能省几十 ms。
+
+### Phase C: 算法图搜索（完全本地）
+
+各 rank **完全本地**完成（这一段真的不走 bootstrap）：
+
+```
+   ┌─ 在 Phase B 的 ncclTopoSystem 上, 跑 4 套算法 ─────────────┐
+   │   ncclTopoCompute(topo, ringGraph)    Pattern=RING         │
+   │   ncclTopoCompute(topo, treeGraph)    Pattern=TREE         │
+   │   ncclTopoCompute(topo, collNet...)   Pattern=...          │
+   │   ncclTopoCompute(topo, nvlsGraph)    Pattern=NVLS         │
+   │   ↓                                                         │
+   │   每个 ncclTopoGraph 包含: nChannels, bwIntra/Inter,       │
+   │   typeIntra/Inter (NVL/PIX/PHB/SYS), pattern, sameChannels │
+   └─────────────────────────────────────────────────────────────┘
+```
+
+因为每个 rank 都用同样的算法 + Phase A/B 后大家拿到的 ncclTopoSystem 相同，**理论上各 rank 算出来的图一致**。
+
+但为了**实测确认一致并对齐元数据**，仍需要下一步 Phase D。
 
 ### Phase D: AllGather3 — 把每 rank 算的图汇总
 
@@ -399,7 +658,11 @@ NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=INIT,GRAPH,NET,BOOTSTRAP ./run.sh
 |---|---|
 | A: ncclPeerInfo allgather | `nccl/src/init.cc:770` |
 | A: ncclPeerInfo struct | `nccl/src/include/transport.h:37` |
-| B: 拓扑探测入口 | `nccl/src/graph/topo.cc` `ncclTopoGetSystem` |
+| B: 拓扑探测入口 | `nccl/src/graph/topo.cc:728` `ncclTopoGetSystem` |
+| B: 同 node fusion 关键调用 | `nccl/src/graph/topo.cc` `bootstrapIntraNodeAllGather` + `ncclTopoFuseXml` |
+| B: ncclTopoSystem 定义 | `nccl/src/graph/topo.h:155` |
+| B: ncclTopoNode 定义 | `nccl/src/graph/topo.h:111` |
+| B: 节点类型 + Link/Path 类型枚举 | `nccl/src/graph/topo.h:32-82` |
 | C: 算法图搜索 | `nccl/src/init.cc:891-944` |
 | D: allGatherInfo allgather | `nccl/src/init.cc:971` |
 | D: 结构体定义 | `nccl/src/init.cc:737-754` |
