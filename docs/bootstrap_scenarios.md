@@ -23,6 +23,66 @@
 
 ---
 
+## 题外话：用户与 NCCL 的职责边界
+
+用户调一行 `ncclCommInitRank(comm, nRanks, uid, myRank)`，哪些事 NCCL 干、哪些事用户必须自己处理？很多人卡在这条边界上，所以先单独拎出来。
+
+```
+   用户负责                                        NCCL 负责
+   ────────                                        ────────
+   1. 在 rank 0 调 ncclGetUniqueId(&uid)           生成 128B UID
+                                                   (内含 rank 0 的 IP:port + magic)
+   ────────────────────────────────────────────────────────────────────────────
+   2. 把这 128B UID 送到 *所有* rank               ★ NCCL 完全不管这一步 ★
+      自选机制:
+        - 单进程多 rank: 内存指针 / argv
+        - MPI:           MPI_Bcast(uid, 128B, ...)
+        - PyTorch:       store.set/get("nccl_uid", ...)
+        - 共享文件:      写到 NFS / 本地盘 (你的 all_reduce_2proc 用这个)
+        - env / argv:    父进程 fork 时透传
+   ────────────────────────────────────────────────────────────────────────────
+   3. 每个 rank 各自调                             NCCL 内部把剩下全做完:
+      ncclCommInitRank(                            - rank 0 起 listener
+        comm, nRanks, uid, myRank)                 - accept (nRanks-1) 次 (阻塞!)
+                                                   - 其他 rank 用 uid 里的 ip:port connect
+       ↑                                           - 形成 star → 闭成 ring
+       └── nRanks 是用户告诉 NCCL 的!              - 各 rank 本地 fillInfo (80B)
+           NCCL 由此知道要等多少 peer              - bootstrapAllGather peerInfo
+                                                   - 探拓扑 / 算图 / 建 transport
+                                                   - 返回用户态
+```
+
+**rank 0 会等所有 rank 到齐**：因为 `nRanks` 是构造函数参数，rank 0 的 accept 线程会一直 accept 到收齐 (nRanks-1) 条连接才往下走；任何一个 rank 没及时进 `ncclCommInitRank`，整个 init 就 hang 在 rank 0 的 accept 或某个 `bootstrapAllGather` 上。这就是诊断表里 "ncclCommInitRank 卡死" 的根因。
+
+### rendezvous 和 peerInfo 的先后
+
+一个反直觉的点：**peerInfo 不是 rendezvous 的输入，而是 rendezvous 之后的产物**。各 rank 在 connect rank 0 之前，相互完全不认识；rendezvous 用的是 UID 里编码的 rank 0 IP:port。
+
+```
+   时间 →
+   ──────────────────────────────────────────────────────────────────────────
+   t0  rank 0: ncclGetUniqueId()                            ✓ 有 UID
+   t1  用户: 把 UID 送到其他 rank (MPI/store/file/...)      ✓ 各 rank 拿到 UID
+   t2  各 rank 进 ncclCommInitRank(comm, nRanks, uid, ...)    (只知道自己 + UID)
+   t3  rank 0 listen / 其他 rank connect 到 UID 里的地址    ✓ rendezvous (step 4)
+                                                              (拿到 socket fd, 但
+                                                               不知对端 hostHash/
+                                                               pidHash/busId/...)
+   t4  各 rank 本地 fillInfo() → 自己那 80B peerInfo         ✓ 自己那一格
+   t5  bootstrapAllGather(peerInfo, 80B)                    ✓ peerInfo[nRanks]
+                                                              每 rank 都有全集
+   ──────────────────────────────────────────────────────────────────────────
+       ↑                       ↑                                  ↑
+   只有 UID                rendezvous 完成                    每 rank 有 peer 全集
+   (rank → ip:port 都        (拿到 socket 通路, 但              ("自我介绍"完成,
+    还不知道)                  还没"自我介绍")                   后续选 transport
+                                                                  全靠这张表)
+```
+
+所以"用户在自己上下文中拿到 peerInfo 去 rendezvous"这个直觉是反的——peerInfo **是 rendezvous 完成后的第一笔信息交换** (即 Phase A allgather)。rendezvous 用 UID（预先共享的约定）建通路，peerInfo 用这条通路完成"自我介绍"。
+
+---
+
 ## 题外话：rendezvous 是什么
 
 上面 step 4 写的是 "rendezvous（各 rank connect 到 rank 0）"，这个词在 NCCL 文档里反复出现，先把它澄清下。
@@ -142,6 +202,52 @@ struct ncclPeerInfo {
      ▼                ▼                ▼                ▼
    完整 peer 表 (本地一份, 内容相同)
 ```
+
+#### Phase A 在代码里 ("每 rank 都拿到完整 peerInfo[]" 的证据)
+
+```c
+// nccl/src/init.cc:998-1018  initTransportsRank()
+
+// AllGather1 - begin
+NCCLCHECKGOTO(ncclCalloc(&comm->peerInfo, nranks+1),                 // [L999]  分配 nranks+1 slot
+              ret, fail);                                            //         (+1 给 CollNet root 占位)
+NCCLCHECKGOTO(fillInfo(comm, comm->peerInfo + rank, comm->commHash), // [L1000] 只填自己那一格
+              ret, fail);                                            //         (从本进程取 hostHash/
+                                                                     //          pidHash/cudaDev/busId)
+NCCLCHECKGOTO(bootstrapAllGather(comm->bootstrap,                    // [L1001] 整张表 allgather
+              comm->peerInfo, sizeof(struct ncclPeerInfo)),          //         回来后 slot i = rank i
+              ret, fail);
+COMPILER_ATOMIC_STORE(&comm->peerInfoValid, true, ...);              // [L1002] 标记可用
+
+for (int i = 0; i < nranks; i++) {                                   // [L1005] 遍历全集
+    if (comm->peerInfo[i].hostHash != comm->peerInfo[rank].hostHash) // ← 这里用 i 索引
+        nNodes++;                                                    //   = 任意 peer 的字段
+    if (!comm->peerInfo[i].cuMemSupport) comm->cuMemSupport = 0;     //   都本地可读
+    ...
+}
+// AllGather1 - end
+```
+
+| init.cc 行 | 关键点 |
+|---|---|
+| 999 | `comm->peerInfo` 是 `struct ncclPeerInfo*`，长度 `nranks+1` |
+| 1000 | `fillInfo` 只写 `comm->peerInfo + rank` 这一格；全部字段从本进程取 (`getHostHash`、`getPidHash`、`cudaGetDeviceProperties`、`stat("/dev/shm")`、`comm->busId`)。**不需要事先知道任何 peer** |
+| 1001 | `bootstrapAllGather` —— 每 rank 出 80B、收 `nranks*80B`。这是 rendezvous 完成后的**第一笔**数据交换 |
+| 1005-1018 | 全 rank 遍历 `peerInfo[i]`，导出 `nNodes`、`cuMemSupport`、`globalCrossNicSupport` 等全局属性 |
+
+`comm->peerInfo` 在 communicator 整个生命周期里都在内存里，直到 `ncclCommDestroy` 才在 `init.cc:311` `free(comm->peerInfo)`。后续 Phase C/D/F 选 transport (P2P/IPC/CUMEM/IB/NVLS) 全部基于这张表查 hostHash/pidHash/busId/fabricInfo 做决策。
+
+> **本仓最小复刻**：`my_nccl/src/main.cc:96-124` 同样的 4 步——calloc + fillInfo + bootstrapAllGather + 遍历打印。跑 `all_reduce_2proc` 时两个 rank 都打印同样的 2 行 peerInfo (hostHash 相同、pidHash 不同)，就是"每 rank 都拿到全集"的直接眼见证据。
+
+```
+   每 rank 进程本地           bootstrap AllGather              每 rank 进程本地
+   ───────────────            ─────────────────                ───────────────
+   peerInfo[rank]      ──→    通过 star → ring TCP    ──→    peerInfo[0..nranks-1]
+   = fillInfo()                收齐 nranks × 80B                (完整一份,
+   (只有自己 80B)                                                内容各 rank 相同)
+```
+
+后面 Phase D 的 `allGather3Data` (init.cc:1243)、Phase F 的 `ncclConnect` 256B blob (transport.cc:100) 也是同样模式——每 rank 出自己那部分 → bootstrapAllGather/Send/Recv → 每 rank 拿到全集。
 
 ### Phase B: 拓扑探测（有去重机制，不是各 rank 全干一遍！）
 
