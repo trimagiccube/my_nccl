@@ -83,6 +83,179 @@
 
 ---
 
+## 题外话：Step 1 — 选 OOB 接口（`bootstrapNetInit`）
+
+不变量 6 步里的**第一步**——"选一个能让所有 rank 互通的 IP iface"。源码在 `bootstrap.cc:107` 的 `bootstrapNetInit`。后续整个 OOB 通路（UID 里的 IP、rank 0 listen、所有 bootstrap socket、RAS 网络）都基于它选出来的这一个 iface。
+
+### 调用时机：每**进程**一次（不是每 rank 一次）
+
+```c
+// init.cc:145-156
+static void initOnceFunc() {
+  NCCLCHECKGOTO(ncclOsInitialize(), initResult, exit);
+  initGdrCopy();
+  NCCLCHECKGOTO(bootstrapNetInit(), initResult, exit);    // ← 选 iface
+  initNvtxRegisteredEnums();
+exit:;
+}
+
+static ncclResult_t ncclInit() {
+  std::call_once(initOnceFlag, initOnceFunc);             // ← 进程内只跑一次
+  return initResult;
+}
+```
+
+每个 `ncclCommInitRank` 都进 `ncclInit()`，但被 `std::call_once` 兜住——一个进程里只真正执行一次：
+
+| 场景 | bootstrapNetInit 实际执行次数 |
+|---|---|
+| 单进程 `ncclCommInitAll`（1 进程多 rank） | **1 次** |
+| 单机多进程（每进程 1 rank） | 每进程各 1 次 |
+| 一个进程同时起多个 comm | **1 次** (`call_once` 兜底) |
+
+### 它到底选了什么
+
+源码 `bootstrap.cc:100-101`：
+
+```c
+static char bootstrapNetIfName[MAX_IF_NAME_SIZE+1];   // 比如 "ens4f0np0"
+static union ncclSocketAddress bootstrapNetIfAddr;    // 比如 192.168.80.101
+```
+
+两个**进程级 static** 变量。后续三处吃它：
+
+| 位置 | 用途 |
+|---|---|
+| `bootstrap.cc:451` | `memcpy(&handle->addr, &bootstrapNetIfAddr, ...)` —— rank 0 的 IP 编码进 `ncclUniqueId`（用户分发的 128B）|
+| `bootstrap.cc:527` | 所有 bootstrap socket 的 `bind`/`connect` 地址 |
+| `bootstrap.cc:824` | RAS（Reliability/Serviceability）网络复用 |
+
+**Step 1 选错 → UID 里编码错 IP → 其他 rank connect 不上 → init hang**。
+
+### 选 iface 的优先级（`socket.cc:169-205` `ncclFindInterfaces`）
+
+```
+   ┌─ A. NCCL_SOCKET_IFNAME 显式指定 ──────────────────────────┐
+   │   只在它指定的 iface 里找                                 │
+   │     "eth0"        → 白名单                                │
+   │     "^docker,lo"  → 黑名单 (^ 开头, 逗号分隔)             │
+   │   找不到 → 报错退出, 不 fallback                          │
+   └──────────────────────────────────────────────────────────┘
+                                ↓ (没设)
+   ┌─ B. 自动选, 按优先级 ───────────────────────────────────┐
+   │   1. 名字以 "ib" 开头的 iface     ← IPoIB 优先!          │
+   │        (ib0, ib1, ...)                                   │
+   │   2. 若 NCCL_COMM_ID=<ip:port> 设了:                     │
+   │        找跟它同子网的 iface                              │
+   │   3. 排除 docker / lo / virbr 后剩下第一个               │
+   │        (eth0, ens4f0, enp..., wlan0 都行)                │
+   │   4. docker                                              │
+   │   5. lo                                                  │
+   │   6. virbr                                               │
+   └──────────────────────────────────────────────────────────┘
+```
+
+注意：**iface 是按 sysfs 列表顺序拿第一个匹配的**，没有任何吞吐/延迟评估。
+
+特殊路径：`bootstrapNetInit` 自己里（`bootstrap.cc:111-124`），如果 `NCCL_COMM_ID` 已经设了，**直接走 `ncclFindInterfaceMatchSubnet`**，完全跳过上面 6 级优先——理由是 UID 由用户外部指定了，iface 必须跟那个 IP 同子网。
+
+### 标准和目的
+
+这步要选出的 IP 必须满足三个**硬要求**：
+
+1. **所有 rank 互相可达** —— TCP connect 不被防火墙拦、子网路由通
+2. **每个 host 上能稳定 listen** —— rank 0 要 bind 起 listener
+3. **iface name 在所有 host 上能解析** —— 多机时每台机器都要找得到同名 iface
+
+**不**关心：
+
+- 带宽/延迟 —— bootstrap 一次 init 总流量约 20 KB（2 rank）到几百 KB（16 rank），是后续 GB/s 量级通信的零头
+- 数据路径用什么 transport —— OOB 只是控制平面，跟 NVLink/IB/PCIe 选择完全无关
+
+**为什么 IPoIB 排第一**：IB 集群里 ib0 几乎必然同子网、可路由、没乱七八糟的过滤。是大概率正确的猜测。
+
+### 不同拓扑下的权衡
+
+| 拓扑 | 自动选什么 | 风险 / 取舍 |
+|---|---|---|
+| 单进程多卡 | 第一个非 lo iface | 走 loopback fast-path，谁都行 |
+| 单机多进程 | 同上 | 内核 loopback 路径，仍 OK |
+| 裸金属单 NIC | eth0 / ens... | 没坑 |
+| **裸金属多 NIC**（管理 + 数据） | 列表第一个非 docker/lo 的 ← 可能是慢管理网 | 管理网通常 1G/限速；bootstrap 流量小本身 OK，但和数据流抢同一 NIC 会有干扰 → 显式 `NCCL_SOCKET_IFNAME=` 选数据网更稳 |
+| IB 集群 | ib0 (IPoIB) | 优点：肯定通；缺点：和数据 IB 共享 HCA 资源（流量小可忽略）|
+| 以太 + IB 混合 | **IPoIB 优先** | 想 OOB 完全独立（断 IB 也能诊断）就显式选 eth0 |
+| 容器 / k8s | `^docker,lo,virbr` 已默认排除 | CNI 网（cali..., flannel.1）不在排除内 → 显式给 |
+| 跨子网 / 跨 AZ | 自动选大概率挑错 | `NCCL_COMM_ID=<rank0 ip:port>` + `NCCL_SOCKET_IFNAME=` 双显式 |
+| MNNVL | 跟跨机一样选 IP iface | NVLink fabric **不**做 OOB（chicken-and-egg：要先 OOB 才能发现 fabric）|
+
+**生产铁律**：**别让 NCCL 猜**——显式设 `NCCL_SOCKET_IFNAME`。"测试机 work、部署机 hang" 的常见根因是网卡命名变了（`eno1` / `eth0` / `ens4f0` / `enp...`），自动选挑错。
+
+### `bootstrapNetInitDone` 标记位
+
+```c
+// bootstrap.cc:102, 107-140
+static int bootstrapNetInitDone = 0;
+static std::mutex bootstrapNetMutex;
+
+ncclResult_t bootstrapNetInit() {
+  if (bootstrapNetInitDone == 0) {                  // 快路径: 不取锁先看
+    std::lock_guard<std::mutex> lock(...);
+    if (bootstrapNetInitDone == 0) {                // 取锁后 double-check
+      // ... 选 iface, 写 bootstrapNetIfName/Addr ...
+      bootstrapNetInitDone = 1;                     // ← 标记完成
+    }
+  }
+  return ncclSuccess;
+}
+```
+
+含义和性质：
+
+| 性质 | 说明 |
+|---|---|
+| **进程级**（不是 rank 级） | 同进程所有 rank 共享同一个 IfName/IfAddr |
+| 写在赋值之后 | 一旦 == 1，外面读 IfName/IfAddr 一定有效 |
+| **永不复位** | comm destroy 也不重置；想换 iface 只能重启进程 |
+| double-check locking | thread-safe 单例；外层 `call_once` 是双保险 |
+
+### 一张图：调用 + 数据流
+
+```
+   每个进程第一次进 ncclCommInitRank
+                ↓
+   ncclInit() ── std::call_once ──→ initOnceFunc()
+                                          ↓
+                                    bootstrapNetInit()
+                                          ↓
+                       ┌── NCCL_SOCKET_IFNAME 设了? ──┐
+                       │ 是                            │ 否
+                       ▼                               ▼
+                  按它找/失败                    自动 6 级优先:
+                                                 ib* → COMM_ID 同子网
+                                                 → 非 docker/lo/virbr
+                                                 → docker → lo → virbr
+                       └─────────────┬──────────────┘
+                                     ▼
+              bootstrapNetIfName / bootstrapNetIfAddr 写好
+                                     ▼
+                       bootstrapNetInitDone = 1
+                                     ▼
+              ┌─────────┬─────────────┬──────────────┐
+              ▼         ▼             ▼              ▼
+          UID 编码   bootstrap     bootstrap        RAS
+          (rank 0)    listen      connect/send
+          451 行     527 行         527 行          824 行
+```
+
+确认实际选了啥：
+
+```bash
+NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=BOOTSTRAP ./run.sh
+# 看 "Bootstrap: Using ens4f0np0:192.168.80.101<0>"  ← bootstrap.cc:135 这行
+```
+
+---
+
 ## 题外话：rendezvous 是什么
 
 上面 step 4 写的是 "rendezvous（各 rank connect 到 rank 0）"，这个词在 NCCL 文档里反复出现，先把它澄清下。
